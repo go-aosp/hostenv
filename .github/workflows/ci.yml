@@ -9,6 +9,7 @@ permissions:
   contents: read
 
 jobs:
+  # Build + vet + gofmt + the suite, on the runner's own architecture.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -29,18 +30,74 @@ jobs:
       - run: |
           awk 'NR>1 && $NF==0 {n++; print} END {if (n) {print n " uncovered block(s)"; exit 1}}' cov.out
 
+  # ⛔ THE SUITE RUNS ON ALL SIX OF GO'S 64-BIT TARGETS, NOT JUST BUILDS.
+  #
+  # This package decides what a program resolves and where it writes, from
+  # strings it parses. net.JoinHostPort, an IPv6 literal's brackets and
+  # atomic.Uint64's round-robin are all places where a wrong assumption about
+  # word size or byte order would be invisible on the two architectures a
+  # developer happens to use. s390x is BIG-ENDIAN and is the lane that would
+  # catch it.
+  arch:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64, riscv64, loong64, ppc64le, s390x]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      # ⚠ `qemu-user-static` became a VIRTUAL package with no installation
+      # candidate when ubuntu-latest moved to 26.04 on 2026-10-19, and
+      # installing a provider is not the fix either: `qemu-user-binfmt`
+      # registers binfmt handlers, it does not ship the emulator binaries this
+      # lane invokes. `qemu-user` ships the dynamic `qemu-<arch>`, which is all
+      # `go test -exec` needs. Both are installed and BOTH NAMES are accepted
+      # below. go-tex/engine#645 has the full account; `qemufix` in
+      # go-fleettools/fleettools is what keeps this shape across the fleet.
+      - name: install qemu user-mode emulators
+        timeout-minutes: 10
+        run: sudo apt-get update && sudo apt-get install -y qemu-user qemu-user-binfmt
+      - name: test
+        run: |
+          # ⛔ Resolve the emulator, accept EITHER binary name, and FAIL when
+          # neither is there -- a lane that reports success for an architecture
+          # it never ran is the one outcome this matrix exists to rule out.
+          qemu_for() {
+            for cand in "qemu-$1-static" "qemu-$1"; do
+              command -v "$cand" >/dev/null 2>&1 && { printf '%s\n' "$cand"; return 0; }
+            done
+            echo "::error::no qemu user emulator for $1 (looked for qemu-$1-static and qemu-$1)" >&2
+            return 1
+          }
+          case "${{ matrix.goarch }}" in
+            amd64|arm64) go test -count=1 ./... ;;
+            riscv64) e="$(qemu_for riscv64)" || exit 1; echo "running riscv64 under $e"; GOARCH=riscv64 go test -count=1 -exec="$e" ./... ;;
+            loong64) e="$(qemu_for loongarch64)" || exit 1; echo "running loong64 under $e"; GOARCH=loong64 go test -count=1 -exec="$e" ./... ;;
+            ppc64le) e="$(qemu_for ppc64le)" || exit 1; echo "running ppc64le under $e"; GOARCH=ppc64le go test -count=1 -exec="$e" ./... ;;
+            s390x) e="$(qemu_for s390x)" || exit 1; echo "running s390x under $e"; GOARCH=s390x go test -count=1 -exec="$e" ./... ;;
+            *) echo "::error::unhandled goarch ${{ matrix.goarch }}" >&2; exit 1 ;;
+          esac
+        env:
+          CGO_ENABLED: "0"
+
+  # The targets this package is FOR, built rather than run: android/arm64 is
+  # the whole point, and the others are the hosts a payload's author develops
+  # on.
   build:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
-          # android/arm64 is the target this package exists for, and it is the
-          # only Android target Go links CGO-free.
+          # android/arm64 is the only Android target Go links CGO-free.
           - {goos: android, goarch: arm64}
-          - {goos: linux, goarch: amd64}
-          - {goos: linux, goarch: arm64}
           - {goos: darwin, goarch: arm64}
+          - {goos: darwin, goarch: amd64}
           - {goos: windows, goarch: amd64}
+          - {goos: freebsd, goarch: amd64}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
