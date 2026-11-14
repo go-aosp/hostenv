@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: gofmt -l . > /tmp/fmt.txt 2>&1; test ! -s /tmp/fmt.txt || { cat /tmp/fmt.txt; exit 1; }
+      - run: go vet ./...
+      - run: go test ./... -covermode=atomic -coverprofile=cov.out
+      # Every block of the profile must have been entered. The verdict comes
+      # from the PROFILE and not from `go tool cover -func`: -func attributes a
+      # block to the enclosing function DECLARATION and drops the ones that
+      # have none -- the body of a package-level `var f = func(){...}` -- so its
+      # total can read 100.0% over uncovered code. That is a measured defect,
+      # not a theory (go-zpkg/packages#458: 12 statements hidden behind a green
+      # 100.0%), and this package is full of exactly that shape.
+      - run: |
+          awk 'NR>1 && $NF==0 {n++; print} END {if (n) {print n " uncovered block(s)"; exit 1}}' cov.out
+
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          # android/arm64 is the target this package exists for, and it is the
+          # only Android target Go links CGO-free.
+          - {goos: android, goarch: arm64}
+          - {goos: linux, goarch: amd64}
+          - {goos: linux, goarch: arm64}
+          - {goos: darwin, goarch: arm64}
+          - {goos: windows, goarch: amd64}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build ./...
